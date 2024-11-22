@@ -1,0 +1,58 @@
+---
+title: "Analysis of the association between fluid balance and mortality accounting for changes in disease severity"
+author: "S.G. Blok & H.J. de Grooth"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Load libraries and data
+```{r}
+library(dplyr)
+
+if (rstudioapi::isAvailable()) {
+  # Get the path of the current Rmd file in RStudio
+  current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+} else {
+  # Alternative method for non-RStudio environments
+  current_path <- dirname(normalizePath(knitr::current_input()))
+}
+
+# Set the working directory
+setwd(current_path)
+
+# Load the .rds files
+d_daily <- readRDS("d_daily.rds")
+d <- readRDS("d.rds")
+
+```
+
+Filter the data
+```{r}
+d_daily <- d_daily %>%
+  filter(day > 1)
+```
+
+First we use a simple logistic regression model to predict 90 day mortality using the cumulative fluid balance
+
+```{r}
+# Ensure that mort_90days is a binary factor
+d$mort_90days <- as.factor(d$mort_90days)
+
+# Fit the logistic regression model
+logit_model <- glm(mort_90days ~ fluids_cumulative, data = d, family = binomial)
+
+# Display the summary of the model
+summary(logit_model)
+
+# Extract and display the model summary in a cleaner format
+model_summary <- summary(logit_model)
+knitr::kable(as.data.frame(coef(model_summary)), 
+             caption = "Logistic Regression Model Coefficients")
+
+# Calculate odds ratios and 95% confidence intervals
+odds_ratios <- exp(cbind(OR = coef(logit_model), confint(logit_model)))
+
+# Display the odds ratios
+knitr::kable(odds_ratios, digits = 3, caption = "Odds Ratios and 95% Confidence Intervals")
+```
+Of course these results are massively confounded by length of stay
