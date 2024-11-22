@@ -161,9 +161,9 @@ When we work with non-simulated data, we usually consider more covariates such a
 
 # Time dependent Cox model
 
-Frequently, these type of associations are sometimes also analyzed with a time dependent Cox model (<https://link.springer.com/article/10.1186/s13054-015-0970-1>[)](https://link.springer.com/article/10.1186/s13054-015-0970-1)￼￼Let)[\
-\
-We](https://link.springer.com/article/10.1186/s13054-015-0970-1)￼￼We) will also construct such a model.\
+These type of associations are sometimes also analyzed with a time dependent Cox model (<https://link.springer.com/article/10.1186/s13054-015-0970-1>[)](https://link.springer.com/article/10.1186/s13054-015-0970-1)
+
+We will also construct such a model.\
 \
 Please be aware that we have only 10 days of survival data available here and we have fluids data for every day the patient was alive and in the ICU.\
 
@@ -360,9 +360,7 @@ model_results %>%
 
 # Taking competing risks into account
 
-One important source of possible bias in our previous analysis is that patients are censored at ICU discharge. One way to adjust for this is to use a Fine-Gray Subdistribution Hazard model. Lets do this\
-\
-**In the PRoFLUID this will not necessarily be the case, do we still need to take this into account?**
+One important source of possible bias in our previous analysis is that patients are censored at ICU discharge. One way to adjust for this is to use a Fine-Gray Subdistribution Hazard model. Lets do this
 
 ## Fine-Gray competing risk analysis for mean fluid balance unadjusted
 
