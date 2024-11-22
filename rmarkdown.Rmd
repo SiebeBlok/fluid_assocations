@@ -1,0 +1,471 @@
+---
+title: "Analysis of the association between fluid balance and mortality accounting for changes in disease severity"
+author: "S.G. Blok & H.J. de Grooth"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+    code_folding: hide
+---
+
+# Load libraries and data
+
+```{r setup, warning=FALSE}
+library(dplyr)
+library(kableExtra)
+library(tibble)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(cmprsk)
+library(survey)
+
+if (rstudioapi::isAvailable()) {
+  # Get the path of the current Rmd file in RStudio
+  current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+} else {
+  # Alternative method for non-RStudio environments
+  current_path <- dirname(normalizePath(knitr::current_input()))
+}
+
+# Set the working directory
+setwd(current_path)
+
+# Load the .rds files
+d_daily <- readRDS("d_daily.rds")
+d <- readRDS("d.rds")
+
+```
+
+## Filter the data
+
+```{r}
+d_daily <- d_daily %>%
+  filter(day > 1)
+```
+
+# Logistic regression
+
+We will first use a logistic regression model to investigate the association with fluid balance and mortality at day 90
+
+## Logistic regression using cumulative fluid balance
+
+```{r}
+# Ensure that mort_90days is a binary factor
+d$mort_90days <- as.factor(d$mort_90days)
+
+# Fit the logistic regression model
+cfb_logit_mod <- glm(mort_90days ~ fluids_cumulative, data = d, family = binomial)
+
+# Extract and display the model summary in a cleaner format
+model_summary <- summary(cfb_logit_mod)
+knitr::kable(as.data.frame(coef(model_summary)), 
+             caption = "Logistic Regression Model Coefficients")
+
+# Calculate odds ratios and 95% confidence intervals
+odds_ratios_cum <- exp(cbind(OR = coef(cfb_logit_mod), confint(cfb_logit_mod)))
+
+# Display the odds ratios
+knitr::kable(odds_ratios_cum, digits = 3, caption = "Odds Ratios and 95% Confidence Intervals")
+```
+
+## Using mean fluid balance
+
+Of course the previous results are confounded by length of stay thereby giving the false impression that cumulative fluid balance is protective for mortality. Perhaps we should better use the mean fluids (defined as fluids_cumulative/los)
+
+```{r}
+# Fit the logistic regression model
+mfb_logit_mod <- glm(mort_90days ~ fluids_mean, data = d, family = binomial)
+
+# Extract and display the model summary in a cleaner format
+model_summary <- summary(mfb_logit_mod)
+knitr::kable(as.data.frame(coef(model_summary)), 
+             caption = "Logistic Regression Model Coefficients")
+
+# Calculate odds ratios and 95% confidence intervals
+odds_ratios_mean <- exp(cbind(OR = coef(mfb_logit_mod), confint(mfb_logit_mod)))
+
+# Display the odds ratios
+knitr::kable(odds_ratios_mean, digits = 3, caption = "Odds Ratios and 95% Confidence Intervals")
+```
+
+## Correcting for baseline disease severity
+
+Now we get a much different idea. Mean fluid balance is strongly associated with mortality in this model. Commonly, we then correct for severity of disease at baseline using disease severity scores. Lets do so.
+
+```{r}
+# Fit the logistic regression model
+sev_logit_mod <- glm(mort_90days ~ fluids_mean + severity_baseline, data = d, family = binomial)
+
+
+# Extract and display the model summary in a cleaner format
+model_summary <- summary(sev_logit_mod)
+knitr::kable(as.data.frame(coef(model_summary)), 
+             caption = "Logistic Regression Model Coefficients")
+
+# Calculate odds ratios and 95% confidence intervals
+odds_ratios_sev <- exp(cbind(OR = coef(sev_logit_mod), confint(sev_logit_mod)))
+
+# Display the odds ratios
+knitr::kable(odds_ratios_sev, digits = 3, caption = "Odds Ratios and 95% Confidence Intervals")
+```
+
+## Summary
+
+```{r}
+
+
+# Define rows and assign values manually
+final_table <- data.frame(
+  Variable = c(
+    "Cumulative Fluid Balance", "fluids_cumulative",
+    "Mean Fluid Balance", "fluids_mean",
+    "Mean Fluid Balance Adjusted", "fluids_mean", "severity_baseline"
+  ),
+  `Odds Ratio` = c(
+    "", 0.953,
+    "", 5.479,
+    "", 4.605, 1.182
+  ),
+  `95% CI Lower` = c(
+    "", 0.923,
+    "", 3.654,
+    "", 2.993, 1.020
+  ),
+  `95% CI Upper` = c(
+    "", 0.983,
+    "", 8.339,
+    "", 7.184, 1.371
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Format the table
+final_table %>%
+  kable(
+    format = "html",
+    align = "lccc",
+    col.names = c("Variable", "Odds Ratio", "95% CI Lower", "95% CI Upper"),
+    caption = "Overview of Odds Ratios and 95% Confidence Intervals"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE
+  ) %>%
+  row_spec(c(1, 3, 5), bold = TRUE, background = "#f2f2f2")  # Highlight category rows
+```
+
+When we work with non-simulated data, we usually consider more covariates such as age or admission diagnosis.
+
+# Time dependent Cox model
+
+Frequently, these type of associations are sometimes also analyzed with a time dependent Cox model (<https://link.springer.com/article/10.1186/s13054-015-0970-1>[)](https://link.springer.com/article/10.1186/s13054-015-0970-1)￼￼Let)[\
+\
+We](https://link.springer.com/article/10.1186/s13054-015-0970-1)￼￼We) will also construct such a model.\
+\
+Please be aware that we have only 10 days of survival data available here and we have fluids data for every day the patient was alive and in the ICU.\
+
+## First, plot mortality in the first 10 days
+
+```{r}
+# Filter out rows where both death and discharge are NA
+filtered_data <- d_daily %>%
+  filter(!(is.na(death) & is.na(discharge)))
+
+# Collapse data to one row per patient
+km_data <- filtered_data %>%
+  group_by(pt) %>%
+  summarise(
+    time = max(day, na.rm = TRUE),         # Time to event or censoring
+    status = ifelse(any(death == 1), 1, 0) # Event status: 1 if death occurred, 0 otherwise
+  ) %>%
+  ungroup()
+
+# Fit Kaplan-Meier survival curve
+km_fit <- survfit(Surv(time, status) ~ 1, data = km_data)
+
+# Plot Kaplan-Meier curve
+ggsurvplot(
+  km_fit,
+  data = km_data,
+  conf.int = TRUE,                # Add confidence intervals
+  risk.table = TRUE,              # Show number at risk below the plot
+  ggtheme = theme_minimal(),      # Use a minimal theme
+  title = "Kaplan-Meier Curve for Mortality",
+  xlab = "Time (Days)",
+  ylab = "Survival Probability"
+)
+```
+
+## Cox proportional hazards regression using total fluids
+
+```{r}
+
+# Filter out rows where both death and discharge are NA
+filtered_data <- d_daily %>%
+  filter(!(is.na(death) & is.na(discharge)))
+
+# Collapse data to one row per patient for survival analysis
+cox_data <- filtered_data %>%
+  group_by(pt) %>%
+  summarise(
+    time = max(day, na.rm = TRUE),         # Time to event or censoring
+    status = ifelse(any(death == 1), 1, 0), # Event indicator: 1 if death occurred, 0 otherwise
+    fluids = sum(fluids, na.rm = TRUE)     # Total fluids as a summary measure (or choose another)
+  ) %>%
+  ungroup()
+
+# Fit the Cox model with fluids as a covariate
+cox_model <- coxph(Surv(time, status) ~ fluids, data = cox_data)
+
+# Summary of the model
+summary(cox_model)
+```
+
+This of course is again quite biased by LOS. Cumulative fluid balance is now again protective for death as the patients that do not die can keep accumulating fluids.
+
+## Cox proportional hazards with time-varying fluid as a covariate
+
+```{r}
+
+cox_time_varying_data <- d_daily %>%
+  filter(!(is.na(death) & is.na(discharge))) %>%  # Remove irrelevant rows
+  group_by(pt) %>%
+  mutate(
+    last_day = max(day, na.rm = TRUE),            # Patient's last observed day
+    event_day = ifelse(death == 1, day, NA),      # Day of death if applicable
+    status = ifelse(death == 1 & day == last_day, 1, 0)  # Status = 1 for death interval
+  ) %>%
+  ungroup() %>%
+  mutate(
+    start = day - 1,  # Start of interval
+    stop = day        # Stop of interval
+  )
+
+# Fit the Cox model with time-varying covariates
+cox_time_varying_model <- coxph(
+  Surv(start, stop, status) ~ fluids,
+  data = cox_time_varying_data
+)
+
+# Summary of the model
+summary(cox_time_varying_model)
+```
+
+## Cox proportional hazards with time-varying fluid and baseline disease severity score as a covariate
+
+```{r}
+# Step 1: Extract the first measured severity for each patient
+first_severity <- d_daily %>%
+  group_by(pt) %>%
+  summarise(severity_first = first(severity[!is.na(severity)])) %>% # First non-NA severity
+  ungroup()
+
+# Step 2: Merge the static first severity into the time-varying dataset
+cox_static_severity_data <- cox_time_varying_data %>%
+  left_join(first_severity, by = "pt")             # Add static severity
+
+# Step 3: Fit the Cox model with static severity
+cox_model_static_severity <- coxph(
+  Surv(start, stop, status) ~ fluids + severity_first,
+  data = cox_static_severity_data
+)
+
+# Summary of the model
+summary(cox_model_static_severity)
+```
+
+## Cox proportional hazards with time-varying fluid and time varying disease severity score as a covariate
+
+```{r}
+cox_model_dynamic_severity <- coxph(
+  Surv(start, stop, status) ~ fluids + severity,
+  data = cox_time_varying_data
+)
+
+# Summary of the adjusted model
+summary(cox_model_dynamic_severity)
+```
+
+## Summary
+
+```{r}
+# Extract key results from each Cox model
+model_results <- data.frame(
+  Model = c(
+    "Unadjusted (fluids only)",
+    "Time-Varying Covariate (fluids)",
+    "Baseline Severity Adjusted (fluids)",
+    "Baseline Severity Adjusted (severity)",
+    "Dynamic Severity Adjusted (fluids)",
+    "Dynamic Severity Adjusted (severity)"
+  ),
+  HR = c(
+    exp(coef(cox_model)["fluids"]),
+    exp(coef(cox_time_varying_model)["fluids"]),
+    exp(coef(cox_model_static_severity)["fluids"]),
+    exp(coef(cox_model_static_severity)["severity_first"]),
+    exp(coef(cox_model_dynamic_severity)["fluids"]),
+    exp(coef(cox_model_dynamic_severity)["severity"])
+  ),
+  CI_Lower = c(  # Changed to use _
+    summary(cox_model)$conf.int["fluids", "lower .95"],
+    summary(cox_time_varying_model)$conf.int["fluids", "lower .95"],
+    summary(cox_model_static_severity)$conf.int["fluids", "lower .95"],
+    summary(cox_model_static_severity)$conf.int["severity_first", "lower .95"],
+    summary(cox_model_dynamic_severity)$conf.int["fluids", "lower .95"],
+    summary(cox_model_dynamic_severity)$conf.int["severity", "lower .95"]
+  ),
+  CI_Upper = c(  # Changed to use _
+    summary(cox_model)$conf.int["fluids", "upper .95"],
+    summary(cox_time_varying_model)$conf.int["fluids", "upper .95"],
+    summary(cox_model_static_severity)$conf.int["fluids", "upper .95"],
+    summary(cox_model_static_severity)$conf.int["severity_first", "upper .95"],
+    summary(cox_model_dynamic_severity)$conf.int["fluids", "upper .95"],
+    summary(cox_model_dynamic_severity)$conf.int["severity", "upper .95"]
+  ),
+  P_value = c(
+    summary(cox_model)$coefficients["fluids", "Pr(>|z|)"],
+    summary(cox_time_varying_model)$coefficients["fluids", "Pr(>|z|)"],
+    summary(cox_model_static_severity)$coefficients["fluids", "Pr(>|z|)"],
+    summary(cox_model_static_severity)$coefficients["severity_first", "Pr(>|z|)"],
+    summary(cox_model_dynamic_severity)$coefficients["fluids", "Pr(>|z|)"],
+    summary(cox_model_dynamic_severity)$coefficients["severity", "Pr(>|z|)"]
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Round values for readability
+model_results <- model_results %>%
+  mutate(
+    HR = round(HR, 2),
+    CI_Lower = round(CI_Lower, 2),
+    CI_Upper = round(CI_Upper, 2),
+    P_value = formatC(P_value, format = "e", digits = 2)
+  )
+
+# Create a neat summary table
+model_results %>%
+  kbl(
+    col.names = c("Model", "Hazard Ratio (HR)", "CI Lower", "CI Upper", "P-value"),
+    caption = "Summary of Cox Models for Fluids and Severity"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE
+  )
+```
+
+# Taking competing risks into account
+
+One important source of possible bias in our previous analysis is that patients are censored at ICU discharge. One way to adjust for this is to use a Fine-Gray Subdistribution Hazard model. Lets do this\
+\
+**In the PRoFLUID this will not necessarily be the case, do we still need to take this into account?**
+
+## Fine-Gray competing risk analysis for mean fluid balance unadjusted
+
+```{r}
+
+mean_fluids <- d %>%
+  select(pt, fluids_mean)
+
+cr_data <- d_daily %>%
+  filter(!(is.na(death) & is.na(discharge))) %>%  # Remove rows with no outcomes
+  group_by(pt) %>%
+  summarise(
+    time = max(day, na.rm = TRUE),         # Time to event or censoring
+    event = case_when(
+      any(death == 1) ~ 1,                 # Event = 1 for death
+      any(discharge == 1) ~ 2,             # Event = 2 for discharge
+      TRUE ~ 0                             # Event = 0 for censoring
+    )
+  ) %>%
+  ungroup() %>%
+    left_join(mean_fluids, by = "pt")  # Add mean fluids to the competing risks dataset
+
+
+
+
+
+library(cmprsk)
+
+# Fine-Gray model for death (event = 1, competing event = 2) with fluids
+fg_unadjusted <- crr(
+  ftime = cr_data$time,         # Time-to-event
+  fstatus = cr_data$event,      # Event type (1 = death, 2 = discharge, 0 = censored)
+  cov1 = as.matrix(cr_data$fluids_mean)  # Fluids as a covariate
+)
+
+# Summary of the Fine-Gray model
+summary(fg_unadjusted)
+```
+
+## Fine-Gray competing risk analysis with adjustment for baseline disease severity
+
+```{r}
+mean_fluids_severity_baseline <- d %>%
+  select(pt, fluids_mean, severity_baseline)
+
+cr_data <- d_daily %>%
+  filter(!(is.na(death) & is.na(discharge))) %>%  # Remove rows with no outcomes
+  group_by(pt) %>%
+  summarise(
+    time = max(day, na.rm = TRUE),         # Time to event or censoring
+    event = case_when(
+      any(death == 1) ~ 1,                 # Event = 1 for death
+      any(discharge == 1) ~ 2,             # Event = 2 for discharge
+      TRUE ~ 0                             # Event = 0 for censoring
+    )
+  ) %>%
+  ungroup() %>%
+    left_join(mean_fluids_severity_baseline, by = "pt")  # Add mean fluids to the competing risks dataset
+
+
+
+
+
+library(cmprsk)
+
+# Fine-Gray model for death (event = 1, competing event = 2) with fluids
+fg_adjusted <- crr(
+  ftime = cr_data$time,         # Time-to-event
+  fstatus = cr_data$event,      # Event type (1 = death, 2 = discharge, 0 = censored)
+  cov1 = as.matrix(cr_data[, c("fluids_mean", "severity_baseline")])  # Fluids as a covariate
+)
+
+# Summary of the Fine-Gray model
+summary(fg_adjusted)
+```
+
+So once again we see that if we look at mean fluid balance with or without adjustment for baseline disease severity, there will be an apparent association. Previously, we could take into account varying disease severity. We could do this with landmark analysis, but we lose granularity. We could also try subdistribution hazards with Cox models and time varying disease severity (like previously). However, in that case we would assume death and ICU discharge are indepedent events which is clearly not the case.
+
+# Marginal structural modeling
+
+One solution could be marginal structural modeling. Lets try.
+
+```{r}
+
+# Prepare the long-format dataset
+msm_data <- d_daily %>%
+  filter(!(is.na(death) & is.na(discharge))) %>%
+  mutate(
+    start = day - 1,
+    stop = day,
+    event = case_when(
+      death == 1 ~ 1,       # Death as event of interest
+      discharge == 1 ~ 2,   # Discharge as competing risk
+      TRUE ~ 0              # Censored
+    )
+  )
+
+# Fit a logistic regression model for stabilized weights
+#ipw_model <- glm(
+#  fluids ~ severity + start,  # Predict fluids based on severity and time
+#  data = msm_data,
+#  family = binomial()
+#)
+
+
+```
