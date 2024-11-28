@@ -367,7 +367,7 @@ One important source of possible bias in our previous analysis is that patients 
 ```{r}
 
 mean_fluids <- d %>%
-  select(pt, fluids_mean)
+  dplyr::select(pt, fluids_mean)
 
 cr_data <- d_daily %>%
   filter(!(is.na(death) & is.na(discharge))) %>%  # Remove rows with no outcomes
@@ -443,27 +443,257 @@ So once again we see that if we look at mean fluid balance with or without adjus
 
 One solution could be marginal structural modeling. Lets try.
 
-```{r}
+## Approach using twangContinous and weighted cox PH.
 
-# Prepare the long-format dataset
-msm_data <- d_daily %>%
-  filter(!(is.na(death) & is.na(discharge))) %>%
+I ran into some issues here. It is important to note that fluid is a numerical continous variable. Previous papers such as <https://pubmed.ncbi.nlm.nih.gov/25422275/> did a counterfactual analysis by modelling the exposure variable with the IPW package. But this variable was a binary exposure variable. I could not get it to work with the IPW package and a continuous exposure variable
+
+I also tried using twang but this does not work as it can also not deal with continuous exposure variables. Then I found twangContinous (https://pubmed.ncbi.nlm.nih.gov/26877909/). Importantly, this tool does not handle differences in the days with available data well. For that reason I used carry-forward imputation (is this appropriate?)
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(tidyr)
+
+# Prepare the dataset with carry-forward imputation (Appropriate?)
+d_daily_imputed <- d_daily %>%
+  group_by(pt) %>%
+  arrange(pt, day) %>%
   mutate(
-    start = day - 1,
-    stop = day,
-    event = case_when(
-      death == 1 ~ 1,       # Death as event of interest
-      discharge == 1 ~ 2,   # Discharge as competing risk
-      TRUE ~ 0              # Censored
+    fluids = zoo::na.locf(fluids, na.rm = FALSE),   # Carry-forward imputation
+    severity = zoo::na.locf(severity, na.rm = FALSE)
+  ) %>%
+  ungroup() %>%
+  filter(day > 1)
+d_daily_imputed <- as.data.frame(d_daily_imputed)
+
+
+# Define the IPTW formula for longitudinal treatment MSM
+ps_formula <- fluids ~ severity
+
+# Fit the model using twangContinuous
+library(twangContinuous)
+
+ps_fit <- ps.cont(
+  formula = ps_formula,
+  data = d_daily_imputed,
+  n.trees = 10000,           # Number of boosting iterations
+  interaction.depth = 3,   # Depth of trees
+  shrinkage = 0.01,        # Learning rate
+  stop.method = "wcor",    # Weighted correlation stopping method
+  verbose = TRUE           # Monitor progress
+)
+
+# Summary of the propensity score model
+summary(ps_fit)
+
+# Extract balance table for diagnostics
+bal <- bal.table(ps_fit)
+print(bal)
+
+# Add weights to the dataset
+d_daily_imputed <- d_daily_imputed %>%
+  mutate(weights = ps_fit$w)
+
+# Summary of weights
+summary(d_daily_imputed$weights)
+
+# Visualize weights
+hist(d_daily_imputed$weights, main = "Distribution of Weights", xlab = "Weights")
+
+# Define truncation limits
+truncation_limits <- c(0.01, 0.99)
+
+# Truncate weights
+d_daily_imputed <- d_daily_imputed %>%
+  mutate(
+    truncated_weights = pmin(
+      pmax(weights, quantile(weights, truncation_limits[1])),
+      quantile(weights, truncation_limits[2])
     )
   )
 
-# Fit a logistic regression model for stabilized weights
-#ipw_model <- glm(
-#  fluids ~ severity + start,  # Predict fluids based on severity and time
-#  data = msm_data,
-#  family = binomial()
-#)
+# Check truncated weights
+summary(d_daily_imputed$truncated_weights)
+hist(d_daily_imputed$truncated_weights, main = "Truncated Weights Distribution", xlab = "Truncated Weights")
 
+plot(ps_fit, main = "Covariate Balance Before and After Weighting")
+
+# Define start/stop times for survival analysis
+msm_data <- d_daily_imputed %>%
+  mutate(
+    start = ifelse(day == min(day), 0, day - 1),
+    stop = day
+  )
+
+# Fit weighted Cox PH model
+msm_model <- coxph(
+  Surv(start, stop, death == 1) ~ fluids,
+  data = msm_data,
+  weights = msm_data$truncated_weights
+)
+
+# Display results
+summary(msm_model)
+```
+
+I then came across this article: <https://www.degruyter.com/document/doi/10.1515/jci-2017-0002/html> about Covariate Balancing Inverse Probability Weights for Time-Varying Continuous Interventions. Unfortunately, they do not have the code publically available so instead we calculate non-parametric CBPS fort he IPTW and then do a cox-ph. 
+```{r}
+
+# Load necessary libraries
+library(CBPS)
+
+
+# Prepare the dataset with carry-forward imputation
+d_daily_imputed_cbps <- d_daily %>%
+  group_by(pt) %>%
+  arrange(pt, day) %>%
+  mutate(
+    fluids = zoo::na.locf(fluids, na.rm = FALSE),   # Carry-forward imputation
+    severity = zoo::na.locf(severity, na.rm = FALSE)
+  ) %>%
+  ungroup() %>%
+  filter(day > 1)
+
+d_daily_imputed_cbps <- as.data.frame(d_daily_imputed_cbps)
+
+
+
+# Fit the npCBPS model
+npCBPS_fit <- npCBPS(
+  formula = fluids ~ severity,  # Treatment ~ Covariates
+  data = d_daily_imputed_cbps,
+  corprior = 0.01,             # Default prior for correlation
+  print.level = 1              # Verbosity for diagnostics
+)
+
+# Summary of the npCBPS model
+summary(npCBPS_fit)
+
+# Extract weights
+d_daily_imputed_cbps$weights <- npCBPS_fit$weights
+
+
+# Summary of weights
+summary(d_daily_imputed$weights)
+
+# Visualize weight distribution
+hist(d_daily_imputed$weights, main = "Distribution of Weights", xlab = "Weights")
+
+
+# Define truncation limits
+truncation_limits <- c(0.01, 0.99)
+
+# Truncate weights
+d_daily_imputed_cbps <- d_daily_imputed_cbps %>%
+  mutate(
+    truncated_weights = pmin(
+      pmax(weights, quantile(weights, truncation_limits[1])),
+      quantile(weights, truncation_limits[2])
+    )
+  )
+
+# Check summary of truncated weights
+summary(d_daily_imputed_cbps$truncated_weights)
+
+# Visualize the distribution of truncated weights
+hist(d_daily_imputed_cbps$truncated_weights, main = "Truncated Weights Distribution", xlab = "Truncated Weights")
+
+
+
+d_daily_imputed_cbps <- d_daily_imputed_cbps %>%
+  mutate(
+    start = ifelse(day == min(day), 0, day - 1),
+    stop = day
+  )
+
+# Fit the Marginal Structural Model (MSM)
+msm_model_nCBPS <- coxph(
+  Surv(start, stop, death == 1) ~ fluids,   # Marginal effect of fluids
+  data = d_daily_imputed_cbps,                         # Long-format data
+  weights = d_daily_imputed_cbps$truncated_weights           # CBPS-derived weights as IPWs
+)
+
+# Display the MSM summary
+summary(msm_model_nCBPS)
+```
+With this method the bias persists. Maybe I am doing something wrong?
+
+## Plot observed and counterfactual survival (am I doing this correctly>)
+```{r}
+#Predict survival probabilities under observed and counterfactual exposures
+
+# Observed survival probabilities
+msm_surv_observed <- survfit(msm_model)
+
+# Counterfactual: Set fluids to a specific level (e.g., median)
+counterfactual_data <- msm_data %>%
+  mutate(fluids = median(fluids))  # Replace with counterfactual level
+
+# Predict survival probabilities under counterfactual scenario
+msm_model_counterfactual <- coxph(
+  Surv(start, stop, death == 1) ~ fluids,
+  data = counterfactual_data,
+  weights = truncated_weights  # Use the same weights
+)
+msm_surv_counterfactual <- survfit(msm_model_counterfactual)
+
+#Compute attributable mortality
+# Mortality = 1 - Survival Probability
+time_points <- msm_surv_observed$time
+mortality_observed <- 1 - msm_surv_observed$surv
+mortality_counterfactual <- 1 - msm_surv_counterfactual$surv
+
+# Attributable Mortality
+attributable_mortality <- mortality_observed - mortality_counterfactual
+
+# Load ggplot2
+library(ggplot2)
+library(dplyr)
+
+# Step 1: Prepare the data for ggplot
+plot_data <- data.frame(
+  time = msm_surv_observed$time,
+  mortality_observed = 1 - msm_surv_observed$surv,
+  mortality_counterfactual = 1 - msm_surv_counterfactual$surv
+) %>%
+  pivot_longer(
+    cols = c(mortality_observed, mortality_counterfactual),
+    names_to = "Type",
+    values_to = "Mortality"
+  ) %>%
+  mutate(Type = recode(Type, 
+                       "mortality_observed" = "Observed Mortality",
+                       "mortality_counterfactual" = "Counterfactual Mortality"))
+
+# Step 2: Create the plot
+ggplot(plot_data, aes(x = time, y = Mortality, color = Type)) +
+  geom_line(size = 1.2) +
+  labs(
+    title = "Observed vs. Counterfactual Mortality",
+    x = "Time",
+    y = "Cumulative Mortality",
+    color = "Mortality Type"
+  ) +
+  scale_color_manual(values = c("blue", "green")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+```
+As you can see here there is no difference between observed or counterfactual mortality (if all patients received the median fluid balance on all days)
+
+# Competing risk analysis after IPTW (marginal structural competing risk model)
+
+This I have not figured out yet. I can not find a function that can do a competing risk analysis that can use the IPTW that are different for each observed day.
+
+```{r}
 
 ```
+
+# Conclusion
+
+There are multiple ways to approach this problem. It seems that in this simulated dataset we actually got a better estimate of the actual effect by using a time varying cox model than by using a marginal structural model. Implementing competing risks could be an important next step, however to answer our research question it might actually not be needed?
